@@ -63,7 +63,7 @@ def automated_unbind_bypass():
         url_info = "https://100067.connect.garena.com/game/account_security/bind:get_bind_info"
         info_payload = {'app_id': "100067", 'access_token': access_token}
         info_headers = {'User-Agent': "GarenaMSDK/4.0.30"}
-        r_info = requests.get(url_info, params=info_payload, headers=info_headers, timeout=10)
+        r_info = requests.get(url_info, params=info_payload, headers=info_headers, timeout=25)
         email = r_info.json().get("email", "")
     except Exception as e:
         print(f" {Colors.RED}⊛ Error connecting to Garena: {str(e)}{Colors.END}")
