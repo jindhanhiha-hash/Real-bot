@@ -10,7 +10,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import requests
 import urllib3
-from telegram.update import Update
+from telegram import Update
 from telegram.ext import Application, CommandHandler, ContextTypes
 
 # Disable SSL warnings (if needed)
