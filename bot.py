@@ -325,7 +325,7 @@ async def main():
 
     # Build Application request with the configured proxy and timeouts
     request = HTTPXRequest(
-        proxy_url=current_proxy,
+        proxy=current_proxy,
         connect_timeout=CONNECT_TIMEOUT,
         read_timeout=READ_TIMEOUT,
     )
