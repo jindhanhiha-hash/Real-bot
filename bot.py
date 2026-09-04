@@ -299,21 +299,21 @@ async def progress_updater(context: ContextTypes.DEFAULT_TYPE):
             pass
 
 # =============== POLLING WITH RETRIES ===============
-async def run_with_retries(app: Application):
+def run_with_retries(app: Application):
     backoff = 1.0
     max_backoff = 60.0
     while True:
         try:
             logger.info("Starting polling loop...")
-            await app.run_polling(poll_interval=POLL_INTERVAL, close_loop=False, stop_signals=None)
+            app.run_polling(poll_interval=POLL_INTERVAL, close_loop=False, stop_signals=None)
             break
         except NetworkError as e:
             logger.error(f"NetworkError: {e}. Reconnecting in {backoff:.0f}s...")
-            await asyncio.sleep(backoff)
+            time.sleep(backoff)
             backoff = min(backoff * 2, max_backoff)
         except Exception as e:
             logger.critical(f"Unhandled error: {e}. Retrying in 10s.")
-            await asyncio.sleep(10)
+            time.sleep(10)
             backoff = 1.0
 
 # =============== MAIN ===============
@@ -342,11 +342,12 @@ async def main():
     if job_queue:
         job_queue.run_repeating(progress_updater, interval=3, first=0)
 
-    await run_with_retries(app)
+    return app
 
 if __name__ == "__main__":
     try:
-        asyncio.run(main())
+        app = asyncio.run(main())
+        run_with_retries(app)
     except KeyboardInterrupt:
         logger.info("Bot stopped by user.")
         sys.exit(0)
