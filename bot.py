@@ -323,16 +323,12 @@ async def main():
     working_proxy = await find_working_proxy()
     current_proxy = working_proxy  # could be None
 
-    # Build Application with httpx client
-    client_kwargs = {
-        "timeout": httpx.Timeout(CONNECT_TIMEOUT, read=READ_TIMEOUT),
-    }
-    if current_proxy:
-        client_kwargs["proxy"] = current_proxy
-    http_client = httpx.AsyncClient(**client_kwargs)
-
-    # FIX: use 'client=' not 'http_client='
-    request = HTTPXRequest(client=http_client)
+    # Build Application request with the configured proxy and timeouts
+    request = HTTPXRequest(
+        proxy_url=current_proxy,
+        connect_timeout=CONNECT_TIMEOUT,
+        read_timeout=READ_TIMEOUT,
+    )
 
     app = Application.builder().token(BOT_TOKEN).request(request).build()
     app.bot_data["start_time"] = datetime.now()
